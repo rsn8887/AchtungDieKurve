@@ -852,7 +852,8 @@ static void drawSidebar(SDL_Renderer* r) {
     const bool menu = (g_state == MENU);
     const SDL_Color grey = {115, 115, 115, 255};
     const int panelH = 7 * SCORE_SCALE + 2 * PANEL_PAD;
-    const int px = FIELD_W + (SIDEBAR_W - PANEL_W) / 2;
+    // centred between the arena and the left edge of the win bar's frame (WIN_W - 60)
+    const int px = (FIELD_W + (WIN_W - 60) - PANEL_W) / 2;
 
     for (int i = 0; i < MAX_PLAYERS; ++i) {
         const Player& p = g_players[i];
