@@ -46,7 +46,7 @@ ROMFS		:=	$(if $(wildcard romfs/font.ttf),romfs,)
 
 APP_TITLE	:=	Achtung, die Kurve!
 APP_AUTHOR	:=	rsn8887
-APP_VERSION	:=	1.1.0
+APP_VERSION	:=	1.2.0
 
 #---------------------------------------------------------------------------------
 # options for code generation

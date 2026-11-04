@@ -16,7 +16,7 @@ cd "$(dirname "$0")"
 APP_DIR="Achtung die Kurve.app"
 EXE="achtung"
 DMG="Achtung-die-Kurve.dmg"
-VERSION="1.1.0"
+VERSION="1.2.0"
 MIN_MACOS="11.0"
 
 for tool in clang++ sdl2-config dylibbundler sips iconutil hdiutil codesign; do
