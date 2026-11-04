@@ -30,7 +30,7 @@
 //
 // Sound: a fire-explosion sound (embedded in this file) plays whenever a player crashes,
 // and a "Ta-da-da-da-da-DAAA!" fanfare (synthesized at start-up) when somebody wins the match - while a
-// golden "1st place" trophy flies in next to the winner's score.
+// golden coin with an embossed "1" flies in next to the winner's score.
 //
 // Every player starts aimed at the centre of the field.
 // Like in the Amiga original, the speed depends on the background picture: each
@@ -131,7 +131,7 @@ static bool g_resetAccum = false;    // tells the main loop to restart its tick 
 
 static void audioPlayExplosion();   // sound section further down
 static void audioPlayTada();
-static Uint32 g_winTime = 0;         // when the match was won (for the trophy animation)
+static Uint32 g_winTime = 0;         // when the match was won (for the coin animation)
 
 // Game controllers: slot k steers player k. Slots are filled in connection order.
 struct Pad {
@@ -911,30 +911,24 @@ static void drawSidebar(SDL_Renderer* r) {
     }
 }
 
-// ---------------------------------------------------------------- winner's trophy
-// When somebody wins the match, a dark golden trophy with "1ST PLACE" engraved on it flies in
-// from the bottom left and stops left of the winner's score panel. It is drawn once into a
-// texture (twice the size it is shown at, so it comes out smooth) with gradient-filled shapes.
-static SDL_Texture* g_trophyTex = nullptr;
-static const int TROPHY_TW = 240, TROPHY_TH = 300;   // texture size
-static const float TROPHY_W = 120, TROPHY_H = 150;   // size on screen
+// ---------------------------------------------------------------- winner's coin
+// When somebody wins the match, a round golden coin with an embossed "1" flies in from the
+// bottom of the screen and stops left of the winner's score panel. The coin only moves - it
+// never rotates or changes size - so the "1" always stays readable. It is drawn once into a
+// texture (larger than it is shown, so it comes out smooth) from gradient-filled shapes.
+static SDL_Texture* g_coinTex = nullptr;
+static const int COIN_TEX = 256;           // texture size
+static const float COIN_SIZE = 96;         // size on screen
 
-static SDL_Color shadeColor(SDL_Color c, float k) {
-    auto m = [k](int v) { return (Uint8)std::max(0, std::min(255, (int)(v * k))); };
-    SDL_Color o = {m(c.r), m(c.g), m(c.b), c.a};
+static SDL_Color lerpColor(SDL_Color a, SDL_Color b, float t) {
+    auto m = [t](int x, int y) { return (Uint8)std::max(0, std::min(255, (int)(x + (y - x) * t))); };
+    SDL_Color o = {m(a.r, b.r), m(a.g, b.g), m(a.b, b.b), m(a.a, b.a)};
     return o;
-}
-
-static void geoQuad(SDL_Renderer* r, const SDL_FPoint p[4], const SDL_Color c[4]) {
-    SDL_Vertex v[4];
-    for (int i = 0; i < 4; ++i) { v[i].position = p[i]; v[i].color = c[i]; v[i].tex_coord.x = v[i].tex_coord.y = 0; }
-    static const int idx[6] = {0, 1, 2, 0, 2, 3};
-    SDL_RenderGeometry(r, nullptr, v, 4, idx, 6);
 }
 
 // filled ellipse, centre colour -> edge colour
 static void geoEllipse(SDL_Renderer* r, float cx, float cy, float rx, float ry, SDL_Color cc, SDL_Color ce) {
-    const int N = 40;
+    const int N = 64;
     SDL_Vertex v[N + 2];
     int idx[N * 3];
     v[0].position.x = cx; v[0].position.y = cy; v[0].color = cc; v[0].tex_coord.x = v[0].tex_coord.y = 0;
@@ -949,132 +943,113 @@ static void geoEllipse(SDL_Renderer* r, float cx, float cy, float rx, float ry, 
     SDL_RenderGeometry(r, nullptr, v, N + 2, idx, N * 3);
 }
 
-// thick curved line (cubic Bezier) with round joints - used for the handles
-static void geoTube(SDL_Renderer* r, const float b[4][2], float width, SDL_Color col) {
-    const int N = 24;
-    float px = b[0][0], py = b[0][1];
-    for (int i = 1; i <= N; ++i) {
-        float t = (float)i / N, u = 1 - t;
-        float x = u * u * u * b[0][0] + 3 * u * u * t * b[1][0] + 3 * u * t * t * b[2][0] + t * t * t * b[3][0];
-        float y = u * u * u * b[0][1] + 3 * u * u * t * b[1][1] + 3 * u * t * t * b[2][1] + t * t * t * b[3][1];
-        float dx = x - px, dy = y - py, len = std::sqrt(dx * dx + dy * dy) + 1e-6f;
-        float nx = -dy / len * width / 2, ny = dx / len * width / 2;
-        SDL_FPoint q[4] = {{px + nx, py + ny}, {px - nx, py - ny}, {x - nx, y - ny}, {x + nx, y + ny}};
-        SDL_Color c4[4] = {col, col, col, col};
-        geoQuad(r, q, c4);
-        geoEllipse(r, x, y, width / 2, width / 2, col, col);
-        px = x; py = y;
+// A ring between two radii, lit from the upper left. bevel = +1: a slope facing outwards
+// (bright where it faces the light); -1: a slope facing inwards (bright on the far side).
+static void geoRing(SDL_Renderer* r, float cx, float cy, float rin, float rout,
+                    SDL_Color lightC, SDL_Color darkC, float bevel) {
+    const int N = 96;
+    SDL_Vertex v[(N + 1) * 2];
+    int idx[N * 6];
+    for (int i = 0; i <= N; ++i) {
+        float a = 6.2831853f * i / N, nx = std::cos(a), ny = std::sin(a);
+        float lit = 0.5f + 0.5f * bevel * (-0.7071f * nx - 0.7071f * ny);
+        SDL_Color c = lerpColor(darkC, lightC, lit);
+        v[i * 2].position.x = cx + nx * rout; v[i * 2].position.y = cy + ny * rout;
+        v[i * 2 + 1].position.x = cx + nx * rin; v[i * 2 + 1].position.y = cy + ny * rin;
+        v[i * 2].color = v[i * 2 + 1].color = c;
+        v[i * 2].tex_coord.x = v[i * 2].tex_coord.y = v[i * 2 + 1].tex_coord.x = v[i * 2 + 1].tex_coord.y = 0;
     }
+    for (int i = 0; i < N; ++i) {
+        int a = i * 2, b = i * 2 + 1, c = i * 2 + 2, d = i * 2 + 3;
+        int* p = idx + i * 6;
+        p[0] = a; p[1] = b; p[2] = c; p[3] = b; p[4] = d; p[5] = c;
+    }
+    SDL_RenderGeometry(r, nullptr, v, (N + 1) * 2, idx, N * 6);
 }
 
-static void createTrophyTexture(SDL_Renderer* r) {
-    g_trophyTex = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, TROPHY_TW, TROPHY_TH);
-    if (!g_trophyTex) return;
-    SDL_SetTextureBlendMode(g_trophyTex, SDL_BLENDMODE_BLEND);
+static void createCoinTexture(SDL_Renderer* r) {
+    g_coinTex = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, COIN_TEX, COIN_TEX);
+    if (!g_coinTex) return;
+    SDL_SetTextureBlendMode(g_coinTex, SDL_BLENDMODE_BLEND);
     SDL_Texture* prevTarget = SDL_GetRenderTarget(r);
-    SDL_SetRenderTarget(r, g_trophyTex);
+    SDL_SetRenderTarget(r, g_coinTex);
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
     SDL_SetRenderDrawColor(r, 0, 0, 0, 0);
     SDL_RenderClear(r);
 
-    const SDL_Color edgeL = {92, 58, 8, 255}, hi = {208, 158, 40, 255}, mid = {150, 104, 18, 255}, edgeR = {66, 41, 5, 255};
-    const float cx = 120;
-    auto hw = [](float y) { float s = (y - 20) / 155.0f; return 16 + 54 * (1 - std::pow(std::max(0.0f, s), 1.6f)); };
+    const float R = COIN_TEX / 2.0f, u = R / 100.0f, cx = R, cy = R;     // u: one "percent" of the radius
+    const SDL_Color hiGold = {255, 228, 125, 255}, midGold = {196, 146, 30, 255},
+                    darkGold = {112, 70, 8, 255};
 
-    // handles (behind the cup)
-    for (int side = 0; side < 2; ++side) {
-        float sgn = side ? -1.0f : 1.0f;
-        float b[4][2] = {{cx - sgn * 66, 38}, {cx - sgn * 118, 30}, {cx - sgn * 116, 124}, {cx - sgn * 46, 116}};
-        geoTube(r, b, 16, shadeColor(mid, 0.62f));
-        geoTube(r, b, 10, mid);
-        geoTube(r, b, 4, hi);
-    }
-    // stem, knot, two-step base
+    geoEllipse(r, cx, cy, 98 * u, 98 * u, darkGold, darkGold);                           // outer edge
+    geoRing(r, cx, cy, 90 * u, 98 * u, hiGold, darkGold, +1);                            // raised rim: outer slope
+    geoRing(r, cx, cy, 82 * u, 90.3f * u, SDL_Color{236, 188, 62, 255}, midGold, +1);    // rim top
+    // fine ridges around the rim
     {
-        SDL_FPoint q[4] = {{cx - 14, 168}, {cx + 14, 168}, {cx + 14, 216}, {cx - 14, 216}};
-        SDL_Color c[4] = {edgeL, edgeR, edgeR, edgeL};
-        geoQuad(r, q, c);
-        SDL_FPoint q2[4] = {{cx - 8, 168}, {cx - 2, 168}, {cx - 2, 216}, {cx - 8, 216}};
-        SDL_Color c2[4] = {mid, hi, hi, mid};
-        geoQuad(r, q2, c2);
-        geoEllipse(r, cx, 192, 22, 10, hi, shadeColor(mid, 0.8f));
-        SDL_FPoint t1[4] = {{cx - 34, 214}, {cx + 34, 214}, {cx + 44, 236}, {cx - 44, 236}};
-        SDL_Color tc1[4] = {hi, mid, edgeR, edgeL};
-        geoQuad(r, t1, tc1);
-        SDL_FPoint t2[4] = {{cx - 62, 236}, {cx + 62, 236}, {cx + 62, 268}, {cx - 62, 268}};
-        SDL_Color tc2[4] = {mid, shadeColor(mid, 0.75f), shadeColor(edgeR, 0.9f), shadeColor(edgeL, 0.9f)};
-        geoQuad(r, t2, tc2);
-        SDL_FPoint t3[4] = {{cx - 62, 236}, {cx + 62, 236}, {cx + 62, 241}, {cx - 62, 241}};
-        SDL_Color tc3[4] = {hi, hi, mid, mid};
-        geoQuad(r, t3, tc3);
-    }
-    // cup: horizontal slices, each shaded dark - bright - mid - dark, darker towards the bottom
-    const int SL = 28;
-    for (int i = 0; i < SL; ++i) {
-        float y0 = 20 + 155.0f * i / SL, y1 = 20 + 155.0f * (i + 1) / SL;
-        float w0 = hw(y0), w1 = hw(y1);
-        float f0 = 1.0f - 0.30f * i / SL, f1 = 1.0f - 0.30f * (i + 1) / SL;
-        const float cols[4] = {-1.0f, -0.42f, 0.28f, 1.0f};
-        const SDL_Color base[4] = {edgeL, hi, mid, edgeR};
-        for (int k = 0; k < 3; ++k) {
-            SDL_FPoint q[4] = {{cx + cols[k] * w0, y0}, {cx + cols[k + 1] * w0, y0}, {cx + cols[k + 1] * w1, y1}, {cx + cols[k] * w1, y1}};
-            SDL_Color c[4] = {shadeColor(base[k], f0), shadeColor(base[k + 1], f0), shadeColor(base[k + 1], f1), shadeColor(base[k], f1)};
-            geoQuad(r, q, c);
+        const int TICKS = 90;
+        for (int i = 0; i < TICKS; ++i) {
+            float a = 6.2831853f * i / TICKS, da = 6.2831853f / TICKS * 0.28f;
+            float r0 = 83.5f * u, r1 = 88.5f * u;
+            SDL_FPoint q[4] = {{cx + std::cos(a - da) * r0, cy + std::sin(a - da) * r0},
+                               {cx + std::cos(a + da) * r0, cy + std::sin(a + da) * r0},
+                               {cx + std::cos(a + da) * r1, cy + std::sin(a + da) * r1},
+                               {cx + std::cos(a - da) * r1, cy + std::sin(a - da) * r1}};
+            float lit = 0.5f + 0.5f * (-0.7071f * std::cos(a) - 0.7071f * std::sin(a));
+            SDL_Color c = lerpColor(SDL_Color{120, 78, 10, 255}, SDL_Color{176, 128, 28, 255}, lit);
+            SDL_Vertex v[4];
+            for (int k = 0; k < 4; ++k) { v[k].position = q[k]; v[k].color = c; v[k].tex_coord.x = v[k].tex_coord.y = 0; }
+            static const int qi[6] = {0, 1, 2, 0, 2, 3};
+            SDL_RenderGeometry(r, nullptr, v, 4, qi, 6);
         }
     }
-    // rim and dark opening
-    const SDL_Color rim = {226, 182, 66, 255};
-    geoEllipse(r, cx, 20, 73, 12, rim, rim);
-    geoEllipse(r, cx, 21, 63, 8, SDL_Color{34, 20, 3, 255}, SDL_Color{96, 62, 8, 255});
+    geoRing(r, cx, cy, 75 * u, 82.3f * u, SDL_Color{250, 214, 100, 255}, darkGold, -1);  // inner slope down to the face
+    geoEllipse(r, cx, cy, 75.3f * u, 75.3f * u, SDL_Color{238, 192, 64, 255}, SDL_Color{208, 158, 38, 255});   // the face
 
-    // "1ST PLACE", engraved: a dark outline, then bright gold
-    struct Line { const char* text; int maxScale; float yBottom; };
-    const Line lines[2] = {{"1ST", 7, 98}, {"PLACE", 4, 138}};
-    float y = 50;
-    for (int li = 0; li < 2; ++li) {
-        int sc = lines[li].maxScale;
-        while (sc > 1 && textWidth(lines[li].text, sc) > 2 * hw(y + 7 * sc) - 22) --sc;
-        int tw = textWidth(lines[li].text, sc);
-        int tx = (int)(cx - tw / 2.0f), ty = (int)y;
-        SDL_SetRenderDrawColor(r, 56, 32, 2, 255);
-        for (int oy = -2; oy <= 2; ++oy)
-            for (int ox = -2; ox <= 2; ++ox)
-                if (ox || oy) drawText(r, lines[li].text, tx + ox, ty + oy, sc);
-        SDL_SetRenderDrawColor(r, 255, 232, 120, 255);
-        drawText(r, lines[li].text, tx, ty, sc);
-        y += 7 * sc + 16;
-    }
-
+    // soft highlight on the upper left of the face
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    geoEllipse(r, cx - 24 * u, cy - 28 * u, 40 * u, 28 * u, SDL_Color{255, 244, 190, 80}, SDL_Color{255, 244, 190, 0});
+
+    // the embossed "1": a raised digit - bright edge towards the light, dark edge away from it
+    const int sc = std::max(2, (int)std::lround(0.82f * R / 7.0f));
+    const int tw = textWidth("1", sc);
+    const int tx = (int)(cx - tw / 2.0f), ty = (int)(cy - 7 * sc / 2.0f);
+    const int d = std::max(2, (int)(2.2f * u));
+    SDL_SetRenderDrawColor(r, 78, 46, 4, 255);                                           // shadow side
+    drawText(r, "1", tx + d * 2, ty + d * 2, sc);
+    drawText(r, "1", tx + d, ty + d, sc);
+    SDL_SetRenderDrawColor(r, 255, 244, 176, 255);                                       // lit side
+    drawText(r, "1", tx - d, ty - d, sc);
+    SDL_SetRenderDrawColor(r, 240, 194, 66, 255);                                        // the raised top
+    drawText(r, "1", tx, ty, sc);
+
     SDL_SetRenderTarget(r, prevTarget);
 }
 
-static void drawTrophy(SDL_Renderer* r) {
+static void drawCoin(SDL_Renderer* r) {
     if (g_winner < 0) return;
-    if (!g_trophyTex) createTrophyTexture(r);
-    if (!g_trophyTex) return;
+    if (!g_coinTex) createCoinTexture(r);
+    if (!g_coinTex) return;
 
     const float tSec = (SDL_GetTicks() - g_winTime) / 1000.0f;
-    const float t = std::min(1.0f, tSec / 1.7f);
-    const float e = 1.0f - std::pow(1.0f - t, 3.0f);              // smooth: fast at first, gently settling
+    const float t = std::min(1.0f, tSec / 1.6f);
+    const float e = 1.0f - std::pow(1.0f - t, 3.0f);                // smooth: fast at first, gently settling
 
     const int panelH = 7 * SCORE_SCALE + 2 * PANEL_PAD;
     const int px = (FIELD_W + (WIN_W - 60) - PANEL_W) / 2;          // same as the score panels
-    float endX = px - 10 - TROPHY_W / 2;                            // stops to the left of the winner's panel
+    float endX = px - 10 - COIN_SIZE / 2;                           // stops to the left of the winner's panel
     float endY = ROW_Y0 + g_winner * ROW_STEP + panelH / 2.0f;
-    endY = std::max(16 + TROPHY_H / 2, std::min((float)FIELD_H - 16 - TROPHY_H / 2, endY));
-    const float startX = -90, startY = FIELD_H + 90;          // below the bottom-left corner
+    endY = std::max(16 + COIN_SIZE / 2, std::min((float)FIELD_H - 16 - COIN_SIZE / 2, endY));
+    const float startX = endX - 150, startY = FIELD_H + COIN_SIZE;  // below the bottom edge of the screen
 
-    float cx = startX + (endX - startX) * e;
-    float cy = startY + (endY - startY) * e - 110.0f * std::sin(3.14159265f * e);   // a gentle arc
-    float scale = 0.55f + 0.45f * e;
-    float angle = -35.0f * (1.0f - e);                              // tilts upright while flying in
-    SDL_Rect dst = {(int)(cx - TROPHY_W * scale / 2), (int)(cy - TROPHY_H * scale / 2),
-                    (int)(TROPHY_W * scale), (int)(TROPHY_H * scale)};
-    SDL_RenderCopyEx(r, g_trophyTex, nullptr, &dst, angle, nullptr, SDL_FLIP_NONE);
+    // pure translation: only the position changes - no rotation, no scaling
+    const float cx = startX + (endX - startX) * e;
+    const float cy = startY + (endY - startY) * e;
+    SDL_Rect dst = {(int)std::lround(cx - COIN_SIZE / 2), (int)std::lround(cy - COIN_SIZE / 2),
+                    (int)COIN_SIZE, (int)COIN_SIZE};
+    SDL_RenderCopy(r, g_coinTex, nullptr, &dst);
 
     if (t >= 1.0f) {                                                // twinkling sparkles once it has landed
-        static const float off[6][2] = {{-58, -64}, {56, -70}, {-66, 6}, {62, 26}, {-34, 74}, {40, -18}};
+        static const float off[6][2] = {{-44, -46}, {46, -50}, {-52, 6}, {50, 22}, {-26, 56}, {34, -14}};
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
         for (int k = 0; k < 6; ++k) {
             float a = std::sin(tSec * 4.0f + k * 1.9f);
@@ -1115,7 +1090,7 @@ static void render(SDL_Renderer* r, SDL_Texture* field) {
 
     drawArenaBorder(r);
     drawSidebar(r);
-    if (g_state == MATCH_OVER) drawTrophy(r);
+    if (g_state == MATCH_OVER) drawCoin(r);
     SDL_RenderPresent(r);
 }
 
