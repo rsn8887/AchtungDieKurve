@@ -27,6 +27,9 @@
 // In the game, SPACE / a fire button also starts every round ("get ready" -> go).
 //   F11 or Alt+Enter = toggle fullscreen (the window can also be resized / maximized)
 //   ESC = back to the title screen (or quit from the title screen)
+//   Title screen: UP / DOWN arrow (or controller D-pad up / down) removes / adds a CPU
+//   opponent in the first free player slot; a player takes a CPU slot over by pressing
+//   their own LEFT / RIGHT.
 //
 // Sound: a fire-explosion sound (embedded in this file) plays whenever a player crashes,
 // and a "Ta-da-da-da-da-DAAA!" fanfare (synthesized at start-up) when somebody wins the match - while a
@@ -82,7 +85,7 @@ static const int BG_MIN_GRAY = 8;
 static const int BG_MAX_GRAY = 110;
 
 static const int MAX_PLAYERS = 6;
-static const int BORDER_W = 16;         // thickness of the solid frame around the arena (deadly)
+static const int BORDER_W = 14;         // thickness of the solid frame around the arena (deadly)
 static const int ROW_Y0 = 80;           // y of player 1's row (score on the right, controls on the title screen)
 static const int ROW_STEP = 100;        // distance between two player rows
 static const int SCORE_SCALE = 8;       // size of the score numbers (cap height = 7 * 8 = 56 px)
@@ -110,6 +113,9 @@ struct Player {
     bool gap = false;
     bool joinLeft = false, joinRight = false;   // title screen: left / right score digit activated
     bool inGame = false;                        // takes part in the current match
+    bool cpu = false;                           // controlled by the computer (set on the title screen)
+    float skill = 0.8f, aggr = 0.5f;            // CPU: how well it sees / reacts, how much it hunts opponents
+    int cmd = 0, thinkIn = 0, wobble = 0, wobbleDir = 0;   // CPU: current steering, think timer, random swerve
     int score = 0;
     int wins = 0;                               // rounds won as the last survivor (this match)
     SDL_Scancode left, right;
@@ -507,10 +513,11 @@ static void setupPlayers() {
 
 // ---- who takes part ---------------------------------------------------------
 static bool isJoined(const Player& p) { return p.joinLeft && p.joinRight; }
+static bool isParticipant(const Player& p) { return isJoined(p) || p.cpu; }   // human or CPU
 
-static int joinedCount() {
+static int joinedCount() {                      // everybody who would play: humans and CPUs
     int n = 0;
-    for (int i = 0; i < MAX_PLAYERS; ++i) n += isJoined(g_players[i]) ? 1 : 0;
+    for (int i = 0; i < MAX_PLAYERS; ++i) n += isParticipant(g_players[i]) ? 1 : 0;
     return n;
 }
 
@@ -533,8 +540,27 @@ static void resetScores() {
 // activates / deactivates that player's left / right score digit.
 static void togglePlayerJoin(int player, bool right) {
     if (player < 0 || player >= MAX_PLAYERS) return;
-    bool& flag = right ? g_players[player].joinRight : g_players[player].joinLeft;
+    Player& p = g_players[player];
+    if (p.cpu) {                                // a human takes over this slot: no more CPU
+        p.cpu = false;
+        p.joinLeft = p.joinRight = false;
+    }
+    bool& flag = right ? p.joinRight : p.joinLeft;
     flag = !flag;
+}
+
+// Title screen, DOWN: the first free slot becomes a CPU opponent (slots a human has touched
+// are skipped). UP: the highest CPU slot is freed again.
+static void addCpu() {
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        Player& p = g_players[i];
+        if (!p.cpu && !p.joinLeft && !p.joinRight) { p.cpu = true; return; }
+    }
+}
+
+static void removeCpu() {
+    for (int i = MAX_PLAYERS - 1; i >= 0; --i)
+        if (g_players[i].cpu) { g_players[i].cpu = false; return; }
 }
 
 // ---- game controllers ---------------------------------------------------------
@@ -587,6 +613,7 @@ static void newRound(SDL_Renderer* r, SDL_Texture* field) {
         Player& p = g_players[i];
         p.alive = false;
         p.gap = false;
+        p.cmd = 0; p.thinkIn = 0; p.wobble = 0;
         if (!p.inGame) continue;
         // random start position, away from walls, the centre and the other players
         for (int attempt = 0; attempt < 200; ++attempt) {
@@ -606,7 +633,14 @@ static void newRound(SDL_Renderer* r, SDL_Texture* field) {
 // Title screen -> first round. Needs at least two players with both digits activated.
 static bool startMatch(SDL_Renderer* r, SDL_Texture* field) {
     if (joinedCount() < 2) return false;
-    for (int i = 0; i < MAX_PLAYERS; ++i) g_players[i].inGame = isJoined(g_players[i]);
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        Player& p = g_players[i];
+        p.inGame = isParticipant(p);
+        if (p.cpu) {                            // every CPU gets its own character for this match
+            p.skill = frand(0.55f, 1.0f);
+            p.aggr = frand(0.0f, 1.0f);
+        }
+    }
     resetScores();
     newRound(r, field);
     g_state = READY;
@@ -644,6 +678,150 @@ static bool hitsSomething(int i) {
     return false;
 }
 
+// ---------------------------------------------------------------- CPU opponents
+// A CPU player "looks ahead": every few ticks it plays out a handful of possible manoeuvres
+// (go straight, or turn left / right for a while and then go straight) on the real playfield,
+// using the same turn rate and speed as everybody else, and checks how far each one gets before
+// hitting a wall, a trail or another player. It steers along the manoeuvre that survives
+// longest, and among equally safe ones prefers open space - or, for aggressive CPUs, heading
+// for the opponents to cut them off. Every CPU gets its own skill (how far it sees and how
+// quickly it reacts) and its own aggression, and sometimes wobbles for no reason, so the CPUs
+// are different from each other, beatable, and not boring.
+
+// Would a head at (x, y) pointing along `angle` crash `ahead` ticks from now? `opp` holds, for
+// every other player, the stretch (x0, y0, x1, y1) it is expected to have covered by then:
+// its head sits at the end, and everything along the stretch is its fresh trail.
+static bool cpuBlocked(int self, float x, float y, float angle, int ahead,
+                       const float (*opp)[4], int oppCount) {
+    const float dx = std::cos(angle), dy = std::sin(angle);
+    const float reach = RADIUS * 1.45f + 1.0f;
+    const float fx = x + dx * reach, fy = y + dy * reach;
+    for (int k = -3; k <= 3; k += 3) {
+        const float off = RADIUS * k / 3.0f;
+        const int px = (int)std::lround(fx - dy * off), py = (int)std::lround(fy + dx * off);
+        if (px < BORDER_W || py < BORDER_W || px >= FIELD_W - BORDER_W || py >= FIELD_H - BORDER_W) return true;
+        for (int j = 0; j < oppCount; ++j) {
+            const float sx = opp[j][2] - opp[j][0], sy = opp[j][3] - opp[j][1];
+            const float len2 = sx * sx + sy * sy;
+            float t = len2 > 1e-6f ? ((px - opp[j][0]) * sx + (py - opp[j][1]) * sy) / len2 : 0.0f;
+            t = std::max(0.0f, std::min(1.0f, t));
+            const float qx = opp[j][0] + sx * t - px, qy = opp[j][1] + sy * t - py;
+            if (qx * qx + qy * qy <= (RADIUS + 2.5f) * (RADIUS + 2.5f)) return true;
+        }
+        const int idx = py * FIELD_W + px;
+        const int owner = g_owner[idx];
+        if (owner == 0) continue;
+        if (owner - 1 == self && g_stamp[idx] + OWN_GRACE > g_tick + (uint32_t)ahead) continue;   // own fresh trail
+        return true;
+    }
+    return false;
+}
+
+struct CpuView {                       // what a CPU knows about the other players
+    float pos[MAX_PLAYERS][2], vel[MAX_PLAYERS][2];
+    int n = 0;
+};
+
+// Plays out one manoeuvre: turn `dir` (-1 / +1) for `turnTicks` ticks, then straight on.
+// Returns the number of ticks survived (up to `horizon`) and where the head ends up.
+static int cpuRollout(int self, const CpuView& v, float x, float y, float a, float spd,
+                      int dir, int turnTicks, int horizon, float* ex, float* ey, float* ea) {
+    float opp[MAX_PLAYERS][4];
+    int s = 1;
+    for (; s <= horizon; ++s) {
+        if (s <= turnTicks) a += dir * TURN;
+        x += std::cos(a) * spd;
+        y += std::sin(a) * spd;
+        int cnt = 0;
+        if (s <= 45)                                   // the others are expected to keep going straight
+            for (int j = 0; j < v.n; ++j) {
+                opp[cnt][0] = v.pos[j][0]; opp[cnt][1] = v.pos[j][1];
+                opp[cnt][2] = v.pos[j][0] + v.vel[j][0] * s; opp[cnt][3] = v.pos[j][1] + v.vel[j][1] * s;
+                ++cnt;
+            }
+        if (cpuBlocked(self, x, y, a, s, opp, cnt)) break;
+    }
+    *ex = x; *ey = y; *ea = a;
+    return s - 1;
+}
+
+// How much free room lies around a position (0 = boxed in ... 1 = wide open).
+static float cpuOpenness(int self, float x, float y, float a, int horizon) {
+    static const float rel[5] = {-1.2f, -0.6f, 0.0f, 0.6f, 1.2f};
+    int free = 0, total = 0;
+    for (int k = 0; k < 5; ++k) {
+        for (int s = 1; s <= 14; ++s) {
+            float px = x + std::cos(a + rel[k]) * s * 4.0f, py = y + std::sin(a + rel[k]) * s * 4.0f;
+            ++total;
+            if (cpuBlocked(self, px, py, a + rel[k], horizon, nullptr, 0)) break;
+            ++free;
+        }
+    }
+    return free / (float)total;
+}
+
+// Steering command for CPU player i this tick: -1 = left, 0 = straight, +1 = right.
+static int cpuSteer(int i) {
+    Player& p = g_players[i];
+    const float spd = speedAt(p.x, p.y);
+
+    CpuView v;
+    for (int j = 0; j < MAX_PLAYERS; ++j) {
+        if (j == i || !g_players[j].alive) continue;
+        const float sj = speedAt(g_players[j].x, g_players[j].y);
+        v.pos[v.n][0] = g_players[j].x; v.pos[v.n][1] = g_players[j].y;
+        v.vel[v.n][0] = std::cos(g_players[j].angle) * sj; v.vel[v.n][1] = std::sin(g_players[j].angle) * sj;
+        ++v.n;
+    }
+
+    // Reaction time: think only every few ticks - unless the way ahead is about to be blocked.
+    float ex, ey, ea;
+    const int dir0 = p.wobble > 0 ? p.wobbleDir : p.cmd;
+    const bool urgent = cpuRollout(i, v, p.x, p.y, p.angle, spd, dir0, 18, 18, &ex, &ey, &ea) < 18;
+    if (--p.thinkIn > 0 && !urgent) return dir0;
+    p.thinkIn = 2 + (int)std::lround((1.0f - p.skill) * 4.0f);       // skilled CPUs think nearly every tick
+    if (urgent) p.wobble = 0;
+
+    const int horizon = 45 + (int)(55 * p.skill);
+    static const int DURATIONS[] = {3, 8, 14, 22, 32, 45, 60};
+
+    // the opponent closest to us (aggressive CPUs like to head for it)
+    int target = -1;
+    float bestD = 1e9f;
+    for (int k = 0; k < v.n; ++k) {
+        float d = std::hypot(v.pos[k][0] - p.x, v.pos[k][1] - p.y);
+        if (d < bestD) { bestD = d; target = k; }
+    }
+
+    float bestScore = -1e9f;
+    int bestDir = 0, bestSteps = 0;
+    for (int c = -1; c < 2 * 7; ++c) {            // c == -1: straight on; else direction + duration
+        const int dir = (c < 0) ? 0 : (c < 7 ? -1 : +1);
+        const int dur = (c < 0) ? 0 : DURATIONS[c % 7];
+        int steps = cpuRollout(i, v, p.x, p.y, p.angle, spd, dir, dur, horizon, &ex, &ey, &ea);
+        float score = (float)steps;
+        if (steps >= horizon) {                    // safe all the way: prefer open space (and, if bold, the opponent)
+            score += 40.0f * cpuOpenness(i, ex, ey, ea, horizon);
+            if (target >= 0) {
+                float d = std::hypot(v.pos[target][0] - ex, v.pos[target][1] - ey);
+                score += p.aggr * 22.0f * std::max(0.0f, std::min(1.0f, (260.0f - d) / 260.0f));
+            }
+        }
+        score += frand(-1.0f, 1.0f) * (0.5f + 3.0f * (1.0f - p.skill));   // a little human imperfection
+        if (dir == p.cmd) score += 2.5f;           // don't dither between equal choices
+        if (score > bestScore) { bestScore = score; bestDir = dir; bestSteps = steps; }
+    }
+    p.cmd = bestDir;
+
+    // now and then, when everything is fine, swerve a bit for no good reason
+    if (p.wobble <= 0 && bestSteps >= horizon && frand(0.0f, 1.0f) < 0.012f + 0.03f * (1.0f - p.skill)) {
+        p.wobble = 6 + std::rand() % 14;
+        p.wobbleDir = (std::rand() & 1) ? 1 : -1;
+    }
+    if (p.wobble > 0) { --p.wobble; return p.wobbleDir; }
+    return p.cmd;
+}
+
 static int aliveCount() {
     int n = 0;
     for (int i = 0; i < MAX_PLAYERS; ++i) n += g_players[i].alive ? 1 : 0;
@@ -664,8 +842,12 @@ static void updateTick(SDL_Renderer* r, SDL_Texture* field) {
         if (!p.alive) continue;
         float spd = speedAt(p.x, p.y);          // the gray value under the head sets the speed
         // keyboard or the D-pad of this player's controller
-        if (keys[p.left] || padHeld(i, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) p.angle -= TURN;
-        if (keys[p.right] || padHeld(i, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) p.angle += TURN;
+        if (p.cpu) {
+            p.angle += cpuSteer(i) * TURN;
+        } else {
+            if (keys[p.left] || padHeld(i, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) p.angle -= TURN;
+            if (keys[p.right] || padHeld(i, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) p.angle += TURN;
+        }
         p.x += std::cos(p.angle) * spd;
         p.y += std::sin(p.angle) * spd;
 
@@ -783,14 +965,19 @@ static void drawMenu(SDL_Renderer* r) {
     put("BOTH COLORED = YOU", 2, 210);
     put("ARE IN THE GAME.", 2, 210);
     put("PRESS AGAIN TO UNDO.", 2, 210);
-    ty += 20;
+    ty += 14;
+    put("UP / DOWN (OR D-PAD):", 2, 255);
+    put("ADD / REMOVE CPU", 2, 255);
+    put("OPPONENTS. PRESS YOUR", 2, 210);
+    put("OWN KEYS TO TAKE OVER.", 2, 210);
+    ty += 14;
     put("SPACE OR ANY FIRE", 2, 255);
     put("BUTTON STARTS THE GAME", 2, 255);
     put("WITH AT LEAST 2 PLAYERS.", 2, 255);
-    ty += 20;
+    ty += 14;
     put("F11 = FULLSCREEN", 2, 180);
     put("ESC = QUIT", 2, 180);
-    ty += 20;
+    ty += 14;
     put("BACKGROUND SPEED:", 2, 180);
     put(DARK_IS_SLOW ? "DARK = SLOW, LIGHT = FAST" : "DARK = FAST, LIGHT = SLOW", 2, 180);
     for (int i = 0; i < 28; ++i) {                  // legend bar from dark to light
@@ -810,10 +997,10 @@ static void drawMenu(SDL_Renderer* r) {
 }
 
 // The frame around the arena: BORDER_W one-pixel rings from the outer edge inwards, in
-// several greys - a bright bevelled outer edge fading to a dark inner edge.
+// several greys - a dark outer edge rising to a bright inner edge (a raised pedestal).
 static void drawArenaBorder(SDL_Renderer* r) {
-    static const Uint8 RING[BORDER_W] = {39, 63, 166, 180, 161, 146, 134, 122,
-                                         111, 102, 92, 83, 73, 62, 50, 32};
+    static const Uint8 RING[BORDER_W] = {32, 50, 62, 73, 83, 92, 102, 111,
+                                         122, 134, 146, 161, 180, 166};
     for (int d = 0; d < BORDER_W; ++d) {
         SDL_SetRenderDrawColor(r, RING[d], RING[d], RING[d], 255);
         SDL_Rect ring = {d, d, FIELD_W - 2 * d, FIELD_H - 2 * d};
@@ -835,10 +1022,10 @@ static void drawWinBar(SDL_Renderer* r) {
             std::swap(order[b], order[b - 1]);
 
     SDL_Rect frame = {bx - 4, by - 4, bw + 8, bh + 8};
-    SDL_SetRenderDrawColor(r, 150, 150, 150, 255);
+    SDL_SetRenderDrawColor(r, 96, 96, 96, 255);
     SDL_RenderFillRect(r, &frame);
     SDL_Rect inner = {bx - 2, by - 2, bw + 4, bh + 4};
-    SDL_SetRenderDrawColor(r, 96, 96, 96, 255);
+    SDL_SetRenderDrawColor(r, 150, 150, 150, 255);
     SDL_RenderFillRect(r, &inner);
     SDL_Rect back = {bx, by, bw, bh};
     SDL_SetRenderDrawColor(r, 48, 48, 50, 255);
@@ -875,18 +1062,23 @@ static void drawSidebar(SDL_Renderer* r) {
         SDL_Rect outer = {px, y, PANEL_W, panelH};
         SDL_Rect mid = {px + 2, y + 2, PANEL_W - 4, panelH - 4};
         SDL_Rect fill = {px + 4, y + 4, PANEL_W - 8, panelH - 8};
-        SDL_SetRenderDrawColor(r, 150, 150, 150, 255);
-        SDL_RenderFillRect(r, &outer);
         SDL_SetRenderDrawColor(r, 96, 96, 96, 255);
+        SDL_RenderFillRect(r, &outer);
+        SDL_SetRenderDrawColor(r, 150, 150, 150, 255);
         SDL_RenderFillRect(r, &mid);
         SDL_SetRenderDrawColor(r, 48, 48, 50, 255);
         SDL_RenderFillRect(r, &fill);
 
+        if (p.cpu) {                            // "CPU" next to the numbers of a computer player
+            SDL_SetRenderDrawColor(r, p.color.r, p.color.g, p.color.b, 255);
+            drawText(r, "CPU", px + PANEL_W + 8, y + (panelH - 14) / 2, 2);
+        }
+
         int ty = y + PANEL_PAD;
         if (menu) {
             int tx = px + (PANEL_W - textWidth("00", SCORE_SCALE)) / 2;
-            SDL_Color cl = p.joinLeft ? p.color : grey;
-            SDL_Color cr = p.joinRight ? p.color : grey;
+            SDL_Color cl = (p.joinLeft || p.cpu) ? p.color : grey;
+            SDL_Color cr = (p.joinRight || p.cpu) ? p.color : grey;
             SDL_SetRenderDrawColor(r, cl.r, cl.g, cl.b, 255);
             drawText(r, "0", tx, ty, SCORE_SCALE);
             SDL_SetRenderDrawColor(r, cr.r, cr.g, cr.b, 255);
@@ -2143,6 +2335,10 @@ int main(int, char**) {
                     else { g_state = MENU; resetScores(); }
                 } else if (k == SDLK_SPACE || (k == SDLK_RETURN && g_state == MENU)) {
                     advance(renderer, field);
+                } else if (g_state == MENU && k == SDLK_DOWN) {
+                    addCpu();
+                } else if (g_state == MENU && k == SDLK_UP) {
+                    removeCpu();
                 } else if (g_state == MENU) {
                     // title screen: a player's own LEFT / RIGHT key (de)activates a score digit
                     for (int i = 0; i < MAX_PLAYERS; ++i) {
@@ -2160,6 +2356,8 @@ int main(int, char**) {
                 Uint8 b = e.cbutton.button;
                 if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT || b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) {
                     if (g_state == MENU && slot >= 0) togglePlayerJoin(slot, b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+                } else if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN || b == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+                    if (g_state == MENU) { if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) addCpu(); else removeCpu(); }
                 } else if (b == SDL_CONTROLLER_BUTTON_A || b == SDL_CONTROLLER_BUTTON_B ||
                            b == SDL_CONTROLLER_BUTTON_X || b == SDL_CONTROLLER_BUTTON_Y ||
                            b == SDL_CONTROLLER_BUTTON_START) {
