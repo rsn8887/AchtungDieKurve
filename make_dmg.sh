@@ -1,128 +1,115 @@
 #!/bin/bash
-#---------------------------------------------------------------------------------
-# Achtung, die Kurve!  -  builds a macOS .app bundle and a .dmg installer.
+# Builds Achtung, die Kurve! for macOS and packs it into a .dmg (drag the app to Applications).
 #
-# Run this on a Mac, in the folder that contains achtung.cpp, icon.jpg and romfs/:
-#       ./make_dmg.sh
-# Result: Achtung-die-Kurve.dmg  (open it, drag the game onto "Applications")
+#   ./make_dmg.sh [build folder]      default: build-macos next to the project folder
 #
-# One-time setup (Homebrew, https://brew.sh):
-#       xcode-select --install
-#       brew install sdl2 sdl3 sdl2_ttf dylibbundler
-#---------------------------------------------------------------------------------
+# Needs Homebrew's sdl2, sdl3, sdl2_ttf and cmake (brew install sdl2 sdl3 sdl2_ttf cmake).
+# The SDL libraries (and everything they link to) are copied into the app, so it runs on Macs without Homebrew. The app is signed ad hoc (no developer ID): the first
+# time, open it with right-click > Open, or allow it under System Settings > Privacy & Security.
 set -euo pipefail
-cd "$(dirname "$0")"
 
-APP_DIR="Achtung die Kurve.app"
-EXE="achtung"
-DMG="Achtung-die-Kurve.dmg"
-VERSION="1.3.0"
-MIN_MACOS="11.0"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+BUILD="${1:-$ROOT/../build-macos}"
+mkdir -p "$BUILD"
+BUILD="$(cd "$BUILD" && pwd)"
+VERSION="$(sed -n 's/^project(AchtungDieKurve VERSION \([0-9.]*\).*/\1/p' "$ROOT/CMakeLists.txt")"
+APP="$BUILD/AchtungDieKurve.app"
+DMG="$BUILD/AchtungDieKurve-$VERSION-macOS-$(uname -m).dmg"
 
-for tool in clang++ sdl2-config dylibbundler sips iconutil hdiutil codesign; do
-    command -v "$tool" >/dev/null 2>&1 || {
-        echo "Missing tool: $tool"
-        echo "Install the prerequisites:  xcode-select --install ; brew install sdl2 sdl3 sdl2_ttf dylibbundler"
-        exit 1
-    }
+echo "== building in $BUILD"
+cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$BUILD" --target achtung -j "$(sysctl -n hw.ncpu)"
+
+echo "== copying libraries into the app"
+FW="$APP/Contents/Frameworks"
+EXE="$APP/Contents/MacOS/AchtungDieKurve"
+rm -rf "$FW"
+mkdir -p "$FW"
+
+# library references of a binary that are not part of macOS (Homebrew and other local installs)
+deps() {
+  otool -L "$1" | tail -n +2 | awk '{print $1}' | grep -v -E '^(/usr/lib/|/System/)' || true
+}
+# turn a reference (absolute, @rpath, @loader_path) into a real file path; $2 = the binary that refers to it
+resolve() {
+  local ref="$1" from="$2" dir name
+  dir="$(dirname "$from")"
+  case "$ref" in
+    @loader_path/*|@executable_path/*) echo "$dir/${ref#*/}" ;;
+    @rpath/*)
+      name="${ref#@rpath/}"
+      for d in "$dir" "${HOMEBREW_PREFIX:-/opt/homebrew}/lib" /usr/local/lib; do
+        if [ -e "$d/$name" ]; then echo "$d/$name"; return; fi
+      done
+      echo "$ref" ;;
+    *) echo "$ref" ;;
+  esac
+}
+
+# copy every library the game needs (recursively) and point all references at the copies
+queue=("$EXE")
+orig=("$EXE")          # where each queued binary came from, to resolve its relative references
+i=0
+while [ $i -lt ${#queue[@]} ]; do
+  bin="${queue[$i]}"; src="${orig[$i]}"
+  i=$((i + 1))
+  for ref in $(deps "$bin"); do
+    case "$ref" in @executable_path/../Frameworks/*) continue ;; esac   # already bundled
+    path="$(resolve "$ref" "$src")"
+    name="$(basename "$path")"
+    if [ ! -e "$FW/$name" ]; then
+      if [ ! -e "$path" ]; then echo "error: cannot find $ref (needed by $bin)"; exit 1; fi
+      cp -L "$path" "$FW/$name"
+      chmod u+w "$FW/$name"
+      install_name_tool -id "@executable_path/../Frameworks/$name" "$FW/$name" 2>/dev/null
+      queue+=("$FW/$name"); orig+=("$path")
+      echo "   $name"
+    fi
+    install_name_tool -change "$ref" "@executable_path/../Frameworks/$name" "$bin" 2>/dev/null
+  done
 done
-for f in achtung.cpp icon.jpg romfs/font.ttf; do
-    [ -f "$f" ] || { echo "Missing file: $f (run this script in the game's folder)"; exit 1; }
-done
-PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
 
-rm -rf build "$APP_DIR" "$DMG" dmg_stage
-mkdir -p build
-
-echo "==> Compiling"
-clang++ -std=c++11 -O2 -mmacosx-version-min="$MIN_MACOS" achtung.cpp -o "build/$EXE" \
-    $(sdl2-config --cflags) -I"$PREFIX/include" -I"$PREFIX/include/SDL2" \
-    $(sdl2-config --libs) -L"$PREFIX/lib" -lSDL2_ttf
-
-echo "==> Creating $APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Frameworks"
-cp "build/$EXE" "$APP_DIR/Contents/MacOS/$EXE"
-cp romfs/font.ttf "$APP_DIR/Contents/Resources/font.ttf"        # found via SDL_GetBasePath()
-[ -f romfs/FONT-LICENSE.txt ] && cp romfs/FONT-LICENSE.txt "$APP_DIR/Contents/Resources/"
-
-echo "==> Icon"
-ICONSET="build/AppIcon.iconset"
-mkdir -p "$ICONSET"
-for s in 16 32 64 128 256 512; do
-    sips -s format png -z $s $s icon.jpg --out "$ICONSET/tmp_$s.png" >/dev/null
-done
-cp "$ICONSET/tmp_16.png"  "$ICONSET/icon_16x16.png"
-cp "$ICONSET/tmp_32.png"  "$ICONSET/icon_16x16@2x.png"
-cp "$ICONSET/tmp_32.png"  "$ICONSET/icon_32x32.png"
-cp "$ICONSET/tmp_64.png"  "$ICONSET/icon_32x32@2x.png"
-cp "$ICONSET/tmp_128.png" "$ICONSET/icon_128x128.png"
-cp "$ICONSET/tmp_256.png" "$ICONSET/icon_128x128@2x.png"
-cp "$ICONSET/tmp_256.png" "$ICONSET/icon_256x256.png"
-cp "$ICONSET/tmp_512.png" "$ICONSET/icon_256x256@2x.png"
-cp "$ICONSET/tmp_512.png" "$ICONSET/icon_512x512.png"
-rm "$ICONSET"/tmp_*.png
-iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
-
-cat > "$APP_DIR/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key>               <string>Achtung, die Kurve!</string>
-    <key>CFBundleDisplayName</key>        <string>Achtung, die Kurve!</string>
-    <key>CFBundleIdentifier</key>         <string>com.rsn8887.achtung</string>
-    <key>CFBundleExecutable</key>         <string>$EXE</string>
-    <key>CFBundleIconFile</key>           <string>AppIcon</string>
-    <key>CFBundlePackageType</key>        <string>APPL</string>
-    <key>CFBundleShortVersionString</key> <string>$VERSION</string>
-    <key>CFBundleVersion</key>            <string>$VERSION</string>
-    <key>LSMinimumSystemVersion</key>     <string>$MIN_MACOS</string>
-    <key>LSApplicationCategoryType</key>  <string>public.app-category.games</string>
-    <key>NSHighResolutionCapable</key>    <true/>
-    <key>NSHumanReadableCopyright</key>   <string>rsn8887</string>
-</dict>
-</plist>
-PLIST
-
-echo "==> Bundling SDL2 / SDL2_ttf and their libraries into the app"
-dylibbundler -od -b -x "$APP_DIR/Contents/MacOS/$EXE" \
-    -d "$APP_DIR/Contents/Frameworks" -p @executable_path/../Frameworks/ >/dev/null
-
-# Homebrew's "sdl2" is sdl2-compat: a thin layer that loads libSDL3 with dlopen() when the
-# game starts. dylibbundler cannot see such libraries, so copy SDL3 in by hand (next to
-# libSDL2 in Frameworks, where sdl2-compat looks for it, and next to the executable).
-SDL3_LIB=""
-for c in "$PREFIX/lib/libSDL3.0.dylib" "$PREFIX/opt/sdl3/lib/libSDL3.0.dylib" /usr/local/lib/libSDL3.0.dylib; do
-    [ -f "$c" ] && { SDL3_LIB="$c"; break; }
-done
-if [ -n "$SDL3_LIB" ]; then
-    echo "==> Bundling SDL3 (needed by sdl2-compat): $SDL3_LIB"
-    cp -L "$SDL3_LIB" "$APP_DIR/Contents/Frameworks/libSDL3.0.dylib"
-    chmod u+w "$APP_DIR/Contents/Frameworks/libSDL3.0.dylib"
-    install_name_tool -id @executable_path/../Frameworks/libSDL3.0.dylib "$APP_DIR/Contents/Frameworks/libSDL3.0.dylib"
-    dylibbundler -of -b -x "$APP_DIR/Contents/Frameworks/libSDL3.0.dylib" \
-        -d "$APP_DIR/Contents/Frameworks" -p @executable_path/../Frameworks/ >/dev/null
-    ln -sf libSDL3.0.dylib "$APP_DIR/Contents/Frameworks/libSDL3.dylib"
-    cp -L "$APP_DIR/Contents/Frameworks/libSDL3.0.dylib" "$APP_DIR/Contents/MacOS/libSDL3.0.dylib"
-elif otool -L "$APP_DIR/Contents/Frameworks"/libSDL2*.dylib | grep -qi sdl3 || \
-     strings "$APP_DIR/Contents/Frameworks"/libSDL2*.dylib | grep -q "libSDL3"; then
-    echo "ERROR: your SDL2 is sdl2-compat but libSDL3 was not found. Run: brew install sdl3"
-    exit 1
+# Homebrew's "sdl2" is sdl2-compat: a thin layer that loads libSDL3 with dlopen() when the game starts.
+# The loop above cannot see such libraries, so copy SDL3 in by hand (next to libSDL2 in Frameworks, where
+# sdl2-compat looks for it, and next to the executable).
+if strings "$FW"/libSDL2*.dylib | grep -q "libSDL3"; then
+  SDL3_LIB=""
+  for c in "${HOMEBREW_PREFIX:-/opt/homebrew}/lib/libSDL3.0.dylib" "$(brew --prefix sdl3 2>/dev/null)/lib/libSDL3.0.dylib" /usr/local/lib/libSDL3.0.dylib; do
+    if [ -f "$c" ]; then SDL3_LIB="$c"; break; fi
+  done
+  if [ -z "$SDL3_LIB" ]; then echo "error: your SDL2 is sdl2-compat but libSDL3 was not found. Run: brew install sdl3"; exit 1; fi
+  echo "== bundling SDL3 (needed by sdl2-compat): $SDL3_LIB"
+  cp -L "$SDL3_LIB" "$FW/libSDL3.0.dylib"
+  chmod u+w "$FW/libSDL3.0.dylib"
+  install_name_tool -id "@executable_path/../Frameworks/libSDL3.0.dylib" "$FW/libSDL3.0.dylib" 2>/dev/null
+  # libraries SDL3 itself links to (if any are not part of macOS)
+  for ref in $(deps "$FW/libSDL3.0.dylib"); do
+    path="$(resolve "$ref" "$SDL3_LIB")"; name="$(basename "$path")"
+    [ -e "$FW/$name" ] || { cp -L "$path" "$FW/$name"; chmod u+w "$FW/$name"; install_name_tool -id "@executable_path/../Frameworks/$name" "$FW/$name" 2>/dev/null; }
+    install_name_tool -change "$ref" "@executable_path/../Frameworks/$name" "$FW/libSDL3.0.dylib" 2>/dev/null
+  done
+  ln -sf libSDL3.0.dylib "$FW/libSDL3.dylib"
+  cp -L "$FW/libSDL3.0.dylib" "$APP/Contents/MacOS/libSDL3.0.dylib"
 fi
 
-echo "==> Signing (ad-hoc; required for Apple Silicon to run it)"
-xattr -cr "$APP_DIR"
-codesign --force --deep --sign - "$APP_DIR"
-codesign --verify --deep --strict "$APP_DIR"
+echo "== signing"
+for lib in "$FW"/* "$APP"/Contents/MacOS/*.dylib; do [ -f "$lib" ] && [ ! -L "$lib" ] && codesign --force --sign - "$lib"; done
+codesign --force --sign - "$APP"
+codesign --verify --deep --strict "$APP"
 
-echo "==> Creating $DMG"
-mkdir dmg_stage
-cp -R "$APP_DIR" dmg_stage/
-ln -s /Applications dmg_stage/Applications
-hdiutil create -volname "Achtung die Kurve" -srcfolder dmg_stage -ov -format UDZO "$DMG" >/dev/null
-rm -rf dmg_stage
+echo "== checking that nothing outside the app is referenced"
+for bin in "$EXE" "$FW"/*; do
+  if deps "$bin" | grep -v '^@executable_path/' | grep -q .; then
+    echo "error: $bin still refers to:"; deps "$bin" | grep -v '^@executable_path/'; exit 1
+  fi
+done
 
-echo
-echo "Done: $DMG"
-echo "Note: the app is not notarized. If you share the .dmg with others, macOS may block it at"
-echo "first launch: right-click the app > Open (or run: xattr -dr com.apple.quarantine <app>)."
+echo "== making $DMG"
+STAGE="$BUILD/dmg"
+rm -rf "$STAGE" "$DMG"
+mkdir -p "$STAGE"
+cp -R "$APP" "$STAGE/Achtung die Kurve.app"
+ln -s /Applications "$STAGE/Applications"
+hdiutil create -volname "Achtung die Kurve" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+rm -rf "$STAGE"
+echo "done: $DMG"

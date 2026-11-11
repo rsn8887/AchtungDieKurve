@@ -1,14 +1,13 @@
 // Achtung, die Kurve!  -  a small clone in C++ with SDL2
 //
 // Needs SDL2 and SDL2_ttf (text is drawn with SDL2_ttf).
-// Build (Linux / macOS):
+// Build with CMake (macOS, Linux, Windows, Nintendo Switch, Android): see README.md and
+// CMakeLists.txt. Quick one-liner for a test on Linux / macOS:
 //   g++ -std=c++11 -O2 achtung.cpp -o achtung `sdl2-config --cflags --libs` -lSDL2_ttf
-// Build (MSYS2 / MinGW on Windows):
-//   g++ -std=c++11 -O2 achtung.cpp -o achtung.exe -lmingw32 -lSDL2main -lSDL2 -lSDL2_ttf
-//   (or: g++ ... $(pkg-config --cflags --libs sdl2 SDL2_ttf))
-// Font: put a TrueType font named font.ttf next to the program (a copy is delivered with
-// the game). If there is none, the game falls back to a system font (Switch: the system
-// font; desktop: DejaVu Sans / Arial). Nintendo Switch: see the Makefile (romfs/font.ttf).
+// Font: put a TrueType font named font.ttf next to the program (a copy is delivered in
+// romfs/ and CMake copies it there). If there is none, the game falls back to a system font
+// (Switch: the system font; desktop: DejaVu Sans / Arial). Switch / Android: the font is
+// packed into the .nro / the APK.
 //
 // Controls - everyone shares one keyboard, and up to six game controllers work as well
 // (D-pad left / right; controller 1 steers player 1, controller 2 player 2, ... in the
@@ -26,7 +25,8 @@
 // fire button (A, B, X, Y, Start) on any controller - starts the game (2+ players needed).
 // In the game, SPACE / a fire button also starts every round ("get ready" -> go).
 //   F11 or Alt+Enter = toggle fullscreen (the window can also be resized / maximized)
-//   ESC = back to the title screen (or quit from the title screen)
+//   ESC = back to the title screen (or quit from the title screen); Android's Back button
+//   does the same, and a controller's Select / Back / Minus button goes back to the title
 //   Title screen: UP / DOWN arrow (or controller D-pad up / down) removes / adds a CPU
 //   opponent in the first free player slot; a player takes a CPU slot over by pressing
 //   their own LEFT / RIGHT.
@@ -226,6 +226,7 @@ static bool initText() {
     paths.push_back("/System/Library/Fonts/Supplemental/Arial Bold.ttf");
     paths.push_back("/Library/Fonts/Arial Bold.ttf");
     paths.push_back("C:/Windows/Fonts/arialbd.ttf");
+    paths.push_back("/system/fonts/Roboto-Regular.ttf");                        // Android
 
     for (size_t i = 0; i < paths.size(); ++i) {
         std::vector<unsigned char> bytes;
@@ -2330,7 +2331,7 @@ int main(int, char**) {
 
                 if (k == SDLK_F11 || (k == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT))) {
                     toggleFullscreen(window);
-                } else if (k == SDLK_ESCAPE) {
+                } else if (k == SDLK_ESCAPE || k == SDLK_AC_BACK) {   // AC_BACK: Android's Back button
                     if (g_state == MENU) running = false;
                     else { g_state = MENU; resetScores(); }
                 } else if (k == SDLK_SPACE || (k == SDLK_RETURN && g_state == MENU)) {
@@ -2358,6 +2359,9 @@ int main(int, char**) {
                     if (g_state == MENU && slot >= 0) togglePlayerJoin(slot, b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
                 } else if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN || b == SDL_CONTROLLER_BUTTON_DPAD_UP) {
                     if (g_state == MENU) { if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) addCpu(); else removeCpu(); }
+                } else if (b == SDL_CONTROLLER_BUTTON_BACK) {
+                    // Select / Back / Minus: back to the title screen (does not quit, unlike ESC there)
+                    if (g_state != MENU) { g_state = MENU; resetScores(); }
                 } else if (b == SDL_CONTROLLER_BUTTON_A || b == SDL_CONTROLLER_BUTTON_B ||
                            b == SDL_CONTROLLER_BUTTON_X || b == SDL_CONTROLLER_BUTTON_Y ||
                            b == SDL_CONTROLLER_BUTTON_START) {

@@ -1,0 +1,9 @@
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}
+
+// All build output goes into build-android/ next to the project folder, never inside it.
+ext.outDir = file("${rootDir}/../../build-android")
+allprojects {
+    layout.buildDirectory.set(new File(rootProject.ext.outDir, project.name))
+}

@@ -1,0 +1,75 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The version comes from project(AchtungDieKurve VERSION x.y.z) in CMakeLists.txt, like on the other platforms.
+def outDir = rootProject.ext.outDir
+def cmakeLists = file("${rootDir}/../CMakeLists.txt")
+def v = (cmakeLists.text =~ /project\(AchtungDieKurve VERSION (\d+)\.(\d+)\.(\d+)/)
+if (!v.find()) throw new GradleException("no version in CMakeLists.txt")
+def versionString = "${v.group(1)}.${v.group(2)}.${v.group(3)}"
+def versionNumber = v.group(1).toInteger() * 10000 + v.group(2).toInteger() * 100 + v.group(3).toInteger()
+
+// SDL2 and SDL2_ttf source trees (the Docker image has them in /opt and sets these variables)
+def sdl2 = System.getenv('SDL2_SOURCE_DIR') ?: '/opt/SDL2'
+def sdl2ttf = System.getenv('SDL2_TTF_SOURCE_DIR') ?: '/opt/SDL2_ttf'
+def keystore = project.findProperty('keystore') ?: new File(outDir, 'achtung.keystore').path
+
+android {
+    namespace 'com.rsn8887.achtung'
+    compileSdk 34
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId 'com.rsn8887.achtung'
+        minSdk 21
+        targetSdk 34
+        versionCode versionNumber
+        versionName versionString
+        ndk {
+            abiFilters 'arm64-v8a'          // Android handhelds and phones of the last years
+        }
+        externalNativeBuild {
+            cmake {
+                arguments "-DSDL2_SOURCE_DIR=${sdl2}", "-DSDL2_TTF_SOURCE_DIR=${sdl2ttf}"
+            }
+        }
+    }
+
+    signingConfigs {
+        release {
+            storeFile file(keystore)
+            storePassword 'achtung'
+            keyAlias 'achtung'
+            keyPassword 'achtung'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path cmakeLists
+            version '3.22.1'
+            buildStagingDirectory new File(outDir, 'cxx')
+        }
+    }
+
+    sourceSets {
+        main {
+            // SDL's Java side comes from the same SDL source tree as the native library, so they always match
+            java.srcDirs = ['src/main/java', "${sdl2}/android-project/app/src/main/java"]
+            res.srcDirs = ['src/main/res', "${rootDir}/../icon/android"]
+            assets.srcDirs = ["${rootDir}/../romfs"]    // font.ttf: the game reads it from the APK through SDL
+        }
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}
