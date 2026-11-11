@@ -35,7 +35,13 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work achtung-linux-x64
 docker build --platform linux/arm64 -t achtung-linux-arm64 AchtungDieKurve/linux
 docker run --rm --platform linux/arm64 -v "$PWD":/work achtung-linux-arm64
 ```
-Each pair builds the Docker image once (Ubuntu 22.04 with a compiler and the SDL sources) and then creates `build-linux-x86_64/AchtungDieKurve-<version>-linux-x86_64.tar.gz` or `build-linux-aarch64/AchtungDieKurve-<version>-linux-aarch64.tar.gz`. SDL2, SDL2_ttf and the C++ runtime are linked into the executable, so after unpacking, `./achtung` runs on any current Linux (desktop, Steam Deck, Raspberry Pi, ARM handhelds) without installing anything. Keep `font.ttf` next to the executable. A build for the other CPU type runs emulated and is slow; the one that matches your machine is fast.
+Each pair builds the Docker image once (Ubuntu 22.04 with a compiler and the SDL2 / SDL2_ttf development packages) and then creates `build-linux-x86_64/AchtungDieKurve-<version>-linux-x86_64.tar.gz` or `build-linux-aarch64/AchtungDieKurve-<version>-linux-aarch64.tar.gz`. SDL2 and SDL2_ttf are linked dynamically: on the target machine install them once (`sudo apt install libsdl2-2.0-0 libsdl2-ttf-2.0-0`, or your distribution's equivalent), then unpack the archive and run `./achtung`. Keep `font.ttf` next to the executable. The archive also contains a copy of `libSDL2_ttf-2.0.so.0`: if only SDL2 is installed on the target machine (no SDL2_ttf package), start the game with `./runme.sh` instead of `./achtung`. To do the same by hand in the unpacked folder, copy the library from a machine that has it and create the script:
+```
+cp /lib/x86_64-linux-gnu/libSDL2_ttf-2.0.so.0 .      # aarch64-linux-gnu on arm64
+echo -e >runme.sh '#!/usr/bin/env bash\nLD_LIBRARY_PATH=./ ./achtung'
+chmod +x runme.sh achtung
+```
+A build for the other CPU type runs emulated and is slow; the one that matches your machine is fast.
 
 - Switch:
 ```
@@ -57,8 +63,8 @@ The first command builds the Docker image once, with the Android SDK and NDK, Gr
 - Windows:
 Install MSYS2 MinGW, then open a msys2 ucrt shell
 ```
-pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-SDL2 mingw-w64-ucrt-x86_64-SDL2_ttf
-cmake -S AchtungDieKurve -B build -G "MinGW Makefiles" && cmake --build build -j
+pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-SDL2 mingw-w64-ucrt-x86_64-SDL2_ttf
+cmake -S AchtungDieKurve -B build -G Ninja && cmake --build build -j
 curl https://raw.githubusercontent.com/rollerozxa/msys2-bundledlls/master/bundledlls > ./bundledlls
 cd build && ../bundledlls ./achtung.exe ./
 ```
