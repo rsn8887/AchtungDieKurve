@@ -1,7 +1,7 @@
 Achtung, die Kurve!
 =============
 
-A competitive lightcycles game with smooth curves for 2-6 local players, inspired by the Amiga PD classic with the same name.
+A competitive lightcycles game with smooth curves for up to 6 players controlled by humans or CPU opponents, inspired by the Amiga PD classic with the same name.
 
 ![Title Screenshot](/Screenshots/Achtung_Die_Kurve_Screenshot_1.png?raw=true "Title Screenshot")
 
